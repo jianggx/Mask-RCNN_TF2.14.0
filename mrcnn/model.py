@@ -1179,6 +1179,35 @@ def mrcnn_bbox_loss_graph(target_bbox, target_class_ids, pred_bbox):
     return loss
 
 
+# 添加 Lovasz Hinge Loss 实现
+def lovasz_hinge_flat(logits, labels):
+    def compute_loss():
+        signs = 2. * tf.cast(labels, logits.dtype) - 1.
+        errors = 1. - logits * signs
+        errors_sorted, perm = tf.nn.top_k(errors, k=tf.shape(errors)[0])
+        gt_sorted = tf.gather(labels, perm)
+        grad = lovasz_grad(gt_sorted)
+        loss = tf.tensordot(tf.nn.relu(errors_sorted), grad, axes=1)
+        return loss
+
+    logits = tf.reshape(logits, [-1])
+    labels = tf.reshape(labels, [-1])
+    valid = tf.not_equal(labels, -1)
+    logits = tf.boolean_mask(logits, valid)
+    labels = tf.boolean_mask(labels, valid)
+    return tf.cond(tf.equal(tf.size(labels), 0),
+                   lambda: 0.0,
+                   compute_loss)
+
+
+def lovasz_grad(gt_sorted):
+    gts = tf.reduce_sum(gt_sorted)
+    intersection = gts - tf.cumsum(gt_sorted)
+    union = gts + tf.cumsum(1 - gt_sorted)
+    jaccard = 1. - intersection / union
+    return tf.concat([[jaccard[0]], jaccard[:-1] - jaccard[1:]], axis=0)
+
+
 def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
     """Mask binary cross-entropy loss for the masks head.
 
@@ -1215,7 +1244,18 @@ def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
                     K.binary_crossentropy(target=y_true, output=y_pred),
                     tf.constant(0.0))
     loss = K.mean(loss)
-    return loss
+
+    # 计算 Lovasz Hinge Loss
+    def compute_lh_loss():
+        losses = tf.map_fn(lambda x: lovasz_hinge_flat(x[0], x[1]),
+                           (y_pred, y_true), dtype=tf.float32)
+        return tf.reduce_mean(losses)
+
+    lh_loss = tf.cond(tf.size(y_true) > 0,
+                      compute_lh_loss,
+                      lambda: tf.constant(0.0))
+
+    return (loss + lh_loss) / 2
 
 
 ############################################################
@@ -2873,3 +2913,4 @@ def denorm_boxes_graph(boxes, shape):
     scale = tf.concat([h, w, h, w], axis=-1) - tf.constant(1.0)
     shift = tf.constant([0., 0., 1., 1.])
     return tf.cast(tf.round(tf.multiply(boxes, scale) + shift), tf.int32)
+
